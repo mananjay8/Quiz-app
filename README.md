@@ -1,1 +1,2 @@
 # Quiz-app
+MADE BY AYUSHH & MANANJAY

@@ -21,11 +21,11 @@ if not GEMINI_API_KEY:
 
 # Try these in order until one works
 MODEL_CANDIDATES = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-2.0-flash-001",
-    "gemini-3.8-flash",
-    "gemini-1.5-flash",
 ]
 
 # Cache the working model after first success

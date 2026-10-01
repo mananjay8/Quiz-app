@@ -3,8 +3,12 @@ services:
     name: quizgenius
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 180 --preload --max-requests 50 --max-requests-jitter 10
     plan: free
     envVars:
       - key: GEMINI_API_KEY
         sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.11"

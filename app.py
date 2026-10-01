@@ -8,7 +8,11 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
 
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+]
 
 CHUNK_SIZE = 2500        # smaller chunks
 Qs_PER_CALL = 3          # smaller outputs

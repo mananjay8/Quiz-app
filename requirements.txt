@@ -1,5 +1,6 @@
 flask
 gunicorn
 google-genai
+groq
 PyPDF2
 Pillow

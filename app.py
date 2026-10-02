@@ -1,4 +1,5 @@
-import os, sys, json, re, math, time, gc, traceback
+import os, sys, json, re, math, time, gc, traceback, threading, uuid
+from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
@@ -7,22 +8,25 @@ app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"]
-...
-FAST_GEMINI = ["gemini-2.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash"]
+# Fallback lists (used only if dynamic discovery fails)
+GEMINI_FALLBACK = ["gemini-2.5-flash", "gemini-flash-latest"]
+GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+]
 
-GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "meta-llama/llama-4-scout-17b-16e-instruct"]
-FAST_GROQ = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
-
-CHUNK_SIZE = 2500
-Qs_PER_CALL = 3
-MAX_PASSES = 6
-MAX_PDF_PAGES = 6
+CHUNK_SIZE = 3500
+Qs_PER_CALL = 6
+MAX_PASSES = 8
+MAX_PDF_PAGES = 8
 MIN_Q, MAX_Q = 25, 100
 RETRIES = 1
+JOB_TTL_MIN = 15
 
 _gem = None
 _gro = None
+_gem_models_cache = None
 
 
 def get_gem():
@@ -31,8 +35,9 @@ def get_gem():
         try:
             from google import genai
             _gem = genai.Client(api_key=GEMINI_KEY)
+            print("[INIT] Gemini client ready", flush=True)
         except Exception as e:
-            print(f"[INIT] Gemini: {e}", flush=True)
+            print(f"[INIT] Gemini failed: {e}", flush=True)
     return _gem
 
 
@@ -42,9 +47,89 @@ def get_gro():
         try:
             from groq import Groq
             _gro = Groq(api_key=GROQ_KEY)
+            print("[INIT] Groq client ready", flush=True)
         except Exception as e:
-            print(f"[INIT] Groq: {e}", flush=True)
+            print(f"[INIT] Groq failed: {e}", flush=True)
     return _gro
+
+
+def discover_gemini_models():
+    """
+    Ask Gemini which models this API key can actually use.
+    Returns (main_models, fast_models) — ordered best first.
+    Caches the result for the lifetime of the process.
+    """
+    global _gem_models_cache
+    if _gem_models_cache is not None:
+        return _gem_models_cache
+
+    client = get_gem()
+    if not client:
+        _gem_models_cache = (GEMINI_FALLBACK, GEMINI_FALLBACK)
+        return _gem_models_cache
+
+    try:
+        available = [m.name.replace("models/", "") for m in client.models.list()]
+        print(f"[GEMINI] {len(available)} models available", flush=True)
+
+        # Filter for text-generation flash models (exclude TTS, image, live, embedding, etc.)
+        exclude_kw = ["tts", "image", "live", "audio", "embedding", "robotics",
+                      "computer-use", "veo", "lyria", "learnlm", "aqa", "transcribe",
+                      "native-audio", "thinking"]
+        text_models = [m for m in available
+                       if not any(k in m.lower() for k in exclude_kw)]
+
+        # Prefer flash variants; keep pro as a last resort
+        flash = [m for m in text_models if "flash" in m.lower()]
+        pro = [m for m in text_models if "pro" in m.lower() and m not in flash]
+
+        # Sort flash: non-preview first, then by version descending
+        def score(name):
+            s = 0
+            if "preview" in name or "exp" in name: s += 100
+            if "lite" in name: s += 10
+            # Extract version number (e.g. 2.5 from gemini-2.5-flash)
+            m = re.search(r"(\d+)\.(\d+)", name)
+            if m:
+                s -= (int(m.group(1)) * 100 + int(m.group(2)))
+            return s
+
+        flash.sort(key=score)
+        pro.sort(key=score)
+
+        main = flash + pro
+        # Fast list = smaller/lite models first, then rest
+        fast = [m for m in main if "lite" in m.lower()] + [m for m in main if "lite" not in m.lower()]
+
+        if not main:
+            print("[GEMINI] No suitable models found, using fallback", flush=True)
+            main = GEMINI_FALLBACK
+            fast = GEMINI_FALLBACK
+
+        print(f"[GEMINI] Using main: {main[:5]}", flush=True)
+        print(f"[GEMINI] Using fast: {fast[:3]}", flush=True)
+
+        _gem_models_cache = (main[:5], fast[:5])
+        return _gem_models_cache
+
+    except Exception as e:
+        print(f"[GEMINI] Discovery failed: {e}", flush=True)
+        _gem_models_cache = (GEMINI_FALLBACK, GEMINI_FALLBACK)
+        return _gem_models_cache
+
+
+# ---------- JOB STORE ----------
+_jobs = {}
+_jobs_lock = threading.Lock()
+
+
+def _cleanup_jobs():
+    now = datetime.now()
+    with _jobs_lock:
+        dead = [jid for jid, j in _jobs.items()
+                if now - j["created"] > timedelta(minutes=JOB_TTL_MIN)]
+        for jid in dead:
+            del _jobs[jid]
 
 
 @app.errorhandler(413)
@@ -56,22 +141,14 @@ def eall(e):
     return jsonify({"error": f"{type(e).__name__}: {str(e)[:200]}"}), 500
 
 
-# ---------- ROBUST JSON PARSING ----------
+# ---------- JSON HELPERS ----------
 def extract_json(text):
-    """
-    Extract the FIRST valid JSON value from arbitrary text.
-    Uses raw_decode which stops at the end of the JSON and ignores trailing junk.
-    Handles: markdown fences, preamble, trailing comments, extra data.
-    """
     if not text:
         raise ValueError("Empty response")
     text = text.strip()
-    # Strip markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
     text = re.sub(r"\s*```$", "", text)
-
     decoder = json.JSONDecoder()
-    # Try each { or [ position until we find valid JSON
     for i, ch in enumerate(text):
         if ch in "{[":
             try:
@@ -79,24 +156,20 @@ def extract_json(text):
                 return obj
             except json.JSONDecodeError:
                 continue
-    raise ValueError(f"No valid JSON found. Preview: {text[:200]}")
+    raise ValueError(f"No valid JSON. Preview: {text[:200]}")
 
 
 def parse_quiz_array(raw):
     obj = extract_json(raw)
-    if isinstance(obj, dict) and "quiz" in obj:
-        obj = obj["quiz"]
-    if isinstance(obj, dict) and "questions" in obj:
-        obj = obj["questions"]
-    if not isinstance(obj, list):
-        raise ValueError("Not a list")
+    if isinstance(obj, dict) and "quiz" in obj: obj = obj["quiz"]
+    if isinstance(obj, dict) and "questions" in obj: obj = obj["questions"]
+    if not isinstance(obj, list): raise ValueError("Not a list")
     return obj
 
 
 def parse_explain_object(raw):
     obj = extract_json(raw)
-    if not isinstance(obj, dict):
-        raise ValueError("Not an object")
+    if not isinstance(obj, dict): raise ValueError("Not an object")
     return obj
 
 
@@ -147,10 +220,15 @@ def retryable(e):
     return any(k in m for k in ["503","unavailable","overloaded","429","rate limit","500","502","504","timeout","deadline"])
 
 
+def is_404(e):
+    return "404" in str(e) or "not_found" in str(e).lower() or "not found" in str(e).lower()
+
+
+# ---------- PROMPTS ----------
 def quiz_prompt(text, n, diff, existing=None):
     avoid = ""
     if existing:
-        avoid = "\n\nDo NOT repeat these:\n" + "\n".join(f"- {q}" for q in existing[:30])
+        avoid = "\n\nDo NOT repeat:\n" + "\n".join(f"- {q}" for q in existing[:30])
     return f"""Bilingual exam writer for Indian students. Generate exactly {n} MCQs.
 
 RULES:
@@ -158,7 +236,7 @@ RULES:
 - Hindi in Devanagari script only. No romanized Hindi.
 - 4 options each, 1 correct. Short explanation (1 sentence per language).
 - Difficulty: {diff.upper()}.
-- Return ONLY a JSON array. No markdown, no preamble, no trailing text.
+- Return ONLY a JSON array. No markdown.
 
 FORMAT:
 [{{"question":"...","question_hi":"...","options":["A","B","C","D"],"options_hi":["अ","ब","स","द"],"correct":0,"explanation":"...","explanation_hi":"..."}}]
@@ -181,12 +259,12 @@ Correct (HI): {c_hi}
 Style: simple analogy + 3-5 short points + 1 example + 1 memory trick + 1 encouraging line.
 Both English AND Hindi (Devanagari).
 
-Return ONLY this JSON object. No text before or after it. No markdown.
-
+Return ONLY this JSON. No text before or after:
 {{"topic":"...","topic_hi":"...","why_wrong":"...","why_wrong_hi":"...","analogy":"...","analogy_hi":"...","basic_points":["...","..."],"basic_points_hi":["...","..."],"example":"...","example_hi":"...","memory_trick":"...","memory_trick_hi":"...","encouragement":"...","encouragement_hi":"..."}}
 """
 
 
+# ---------- AI CALLS ----------
 def call_gem(prompt, model, img=None, mime=None):
     c = get_gem()
     if not c: raise RuntimeError("Gemini not configured")
@@ -194,7 +272,7 @@ def call_gem(prompt, model, img=None, mime=None):
     parts = [prompt]
     if img and mime:
         parts.append(types.Part.from_bytes(data=img, mime_type=mime))
-    cfg = types.GenerateContentConfig(temperature=0.7, max_output_tokens=6000)
+    cfg = types.GenerateContentConfig(temperature=0.7, max_output_tokens=8000)
     r = c.models.generate_content(model=model, contents=parts, config=cfg)
     raw = getattr(r, "text", None) or ""
     if not raw:
@@ -210,7 +288,7 @@ def call_gro(prompt, model):
     r = c.chat.completions.create(
         messages=[{"role":"system","content":"Bilingual exam writer. Return ONLY JSON."},
                   {"role":"user","content":prompt}],
-        model=model, temperature=0.7, max_tokens=2500,
+        model=model, temperature=0.7, max_tokens=4000,
     )
     raw = r.choices[0].message.content
     if not raw: raise ValueError("Empty from Groq")
@@ -218,9 +296,10 @@ def call_gro(prompt, model):
 
 
 def ai_raw(prompt, img=None, mime=None, fast=False):
-    gm = FAST_GEMINI if fast else GEMINI_MODELS
-    gr = FAST_GROQ if fast else GROQ_MODELS
+    main_models, fast_models = discover_gemini_models()
+    gm = fast_models if fast else main_models
     last = None
+
     if get_gem():
         for m in gm:
             for a in range(RETRIES + 1):
@@ -230,10 +309,13 @@ def ai_raw(prompt, img=None, mime=None, fast=False):
                 except Exception as e:
                     last = e
                     print(f"[G] {m} fail: {str(e)[:120]}", flush=True)
+                    # 404 → try next model immediately (no retry)
+                    if is_404(e): break
                     if not retryable(e): break
-                    if a < RETRIES: time.sleep(1.2**a)
+                    if a < RETRIES: time.sleep(1.2 ** a)
+
     if get_gro() and not img:
-        for m in gr:
+        for m in GROQ_MODELS:
             for a in range(RETRIES + 1):
                 try:
                     print(f"[Q] {m} try{a+1}", flush=True)
@@ -241,9 +323,12 @@ def ai_raw(prompt, img=None, mime=None, fast=False):
                 except Exception as e:
                     last = e
                     print(f"[Q] {m} fail: {str(e)[:120]}", flush=True)
+                    if is_404(e): break
                     if not retryable(e): break
-                    if a < RETRIES: time.sleep(1.2**a)
-    if img and last: raise RuntimeError(f"Image needs Gemini: {str(last)[:150]}")
+                    if a < RETRIES: time.sleep(1.2 ** a)
+
+    if img and last:
+        raise RuntimeError(f"Image needs Gemini: {str(last)[:150]}")
     raise RuntimeError(f"All providers failed: {str(last)[:150]}")
 
 
@@ -251,8 +336,7 @@ def ai_quiz(prompt, img=None, mime=None):
     raw = ai_raw(prompt, img, mime)
     print(f"[AI] {len(raw)} chars", flush=True)
     arr = parse_quiz_array(raw)
-    del raw
-    gc.collect()
+    del raw; gc.collect()
     return validate(arr)
 
 
@@ -284,6 +368,81 @@ def process_file(f):
     raise ValueError("Use PDF, PNG, JPG, or WEBP")
 
 
+# ---------- BACKGROUND WORKER ----------
+def _update_job(job_id, **kwargs):
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id].update(kwargs)
+            _jobs[job_id]["updated"] = datetime.now()
+
+
+def _run_generation(job_id, text, n, diff, img_bytes, img_mime):
+    print(f"[JOB {job_id}] start target={n}", flush=True)
+    try:
+        quiz = []; errors = []; chunks_used = 0; passes = 0
+        _update_job(job_id, status="running")
+
+        if img_bytes:
+            try:
+                part = ai_quiz(quiz_prompt(
+                    "Analyze the attached image and generate the quiz.", n, diff
+                ), img_bytes, img_mime)
+                quiz.extend(part)
+                chunks_used = 1; passes = 1
+                _update_job(job_id, generated=len(quiz), questions=list(quiz))
+            except Exception as e:
+                print(f"[JOB {job_id}] image failed: {e}", flush=True)
+                _update_job(job_id, status="error", error=f"Image failed: {str(e)[:200]}")
+                return
+            img_bytes = None
+        else:
+            chunks = split_text(text, CHUNK_SIZE)
+            chunks_used = len(chunks)
+            _update_job(job_id, chunks=chunks_used)
+            print(f"[JOB {job_id}] {chunks_used} chunk(s)", flush=True)
+
+            for p in range(MAX_PASSES):
+                if len(quiz) >= n: break
+                passes = p + 1
+                for idx, ch in enumerate(chunks):
+                    if len(quiz) >= n: break
+                    want = min(Qs_PER_CALL, n - len(quiz))
+                    try:
+                        part = ai_quiz(quiz_prompt(
+                            ch, want, diff, [q["question"] for q in quiz]
+                        ))
+                        keys = {q["question"].lower().strip()[:80] for q in quiz}
+                        added = 0
+                        for q in part:
+                            k = q["question"].lower().strip()[:80]
+                            if k not in keys:
+                                quiz.append(q); keys.add(k); added += 1
+                        print(f"[JOB {job_id}] p{passes}c{idx+1}: +{added} ({len(quiz)}/{n})", flush=True)
+                        _update_job(job_id, generated=len(quiz),
+                                    questions=list(quiz), passes=passes)
+                        del part, keys; gc.collect()
+                    except Exception as e:
+                        msg = f"p{passes}c{idx+1}: {type(e).__name__}: {str(e)[:120]}"
+                        print(f"[JOB {job_id}] {msg}", flush=True)
+                        errors.append(msg)
+                gc.collect()
+
+        if not quiz:
+            _update_job(job_id, status="error",
+                        error="Could not generate questions. " + " | ".join(errors[-2:]))
+            return
+
+        final = quiz[:n]
+        _update_job(job_id, status="done", questions=final,
+                    generated=len(final), passes=passes,
+                    errors=errors[:3], finished=datetime.now())
+        print(f"[JOB {job_id}] done: {len(final)}", flush=True)
+    except Exception as e:
+        traceback.print_exc()
+        _update_job(job_id, status="error", error=f"{type(e).__name__}: {str(e)[:200]}")
+
+
+# ---------- ROUTES ----------
 @app.route("/")
 def home(): return render_template("index.html")
 
@@ -292,9 +451,17 @@ def health(): return jsonify({"status":"ok"})
 
 @app.route("/debug")
 def dbg():
-    return jsonify({"gem": bool(GEMINI_KEY), "gro": bool(GROQ_KEY),
-                    "chunk": CHUNK_SIZE, "per_call": Qs_PER_CALL,
-                    "groq_models": GROQ_MODELS})
+    main, fast = discover_gemini_models()
+    with _jobs_lock:
+        active = sum(1 for j in _jobs.values() if j["status"] == "running")
+    return jsonify({
+        "gem": bool(GEMINI_KEY), "gro": bool(GROQ_KEY),
+        "gemini_main": main,
+        "gemini_fast": fast,
+        "groq_models": GROQ_MODELS,
+        "chunk": CHUNK_SIZE, "per_call": Qs_PER_CALL,
+        "active_jobs": active,
+    })
 
 @app.route("/recommend", methods=["POST"])
 def rec():
@@ -305,6 +472,7 @@ def rec():
 
 @app.route("/generate", methods=["POST"])
 def generate():
+    _cleanup_jobs()
     try:
         text = (request.form.get("text") or "").strip()
         try: n = int(request.form.get("num_questions", 25))
@@ -322,64 +490,37 @@ def generate():
         if not get_gem() and not get_gro():
             return jsonify({"error": "No API key"}), 500
 
-        print(f"[GEN] target={n} text={len(text)} img={bool(img)}", flush=True)
+        job_id = uuid.uuid4().hex[:12]
+        with _jobs_lock:
+            _jobs[job_id] = {
+                "status": "queued", "total": n, "generated": 0,
+                "questions": [], "chunks": 0, "passes": 0,
+                "created": datetime.now(), "updated": datetime.now(),
+                "file_info": info, "error": None,
+            }
 
-        quiz = []
-        errors = []
-        chunks_used = 0
-        passes = 0
-
-        if img:
-            try:
-                quiz = ai_quiz(quiz_prompt("Analyze the image and generate the quiz.", n, diff), img, mime)
-                chunks_used = 1; passes = 1
-            except Exception as e:
-                return jsonify({"error": f"Image failed: {str(e)[:200]}"}), 500
-            img = None
-        else:
-            chunks = split_text(text, CHUNK_SIZE)
-            chunks_used = len(chunks)
-            print(f"[GEN] {chunks_used} chunk(s)", flush=True)
-
-            for p in range(MAX_PASSES):
-                if len(quiz) >= n: break
-                passes = p + 1
-                for idx, ch in enumerate(chunks):
-                    if len(quiz) >= n: break
-                    want = min(Qs_PER_CALL, n - len(quiz))
-                    try:
-                        part = ai_quiz(quiz_prompt(ch, want, diff, [q["question"] for q in quiz]))
-                        keys = {q["question"].lower().strip()[:80] for q in quiz}
-                        added = 0
-                        for q in part:
-                            k = q["question"].lower().strip()[:80]
-                            if k not in keys:
-                                quiz.append(q); keys.add(k); added += 1
-                        print(f"[GEN] p{passes} c{idx+1}: +{added} ({len(quiz)}/{n})", flush=True)
-                        del part, keys; gc.collect()
-                    except Exception as e:
-                        msg = f"p{passes}c{idx+1}: {type(e).__name__}: {str(e)[:150]}"
-                        print(f"[GEN] {msg}", flush=True)
-                        errors.append(msg)
-                gc.collect()
-
-        if not quiz:
-            d = errors[-3:] if errors else ["No chunks"]
-            return jsonify({"error": "Could not generate. " + " | ".join(d)}), 500
-
-        final = quiz[:n]
-        del quiz, text; gc.collect()
-        print(f"[GEN] done: {len(final)}", flush=True)
-
-        return jsonify({"quiz": final, "meta": {
-            "requested": n, "returned": len(final),
-            "chunks": chunks_used, "passes": passes,
-            "file_info": info, "errors": errors[:3]
-        }})
+        t = threading.Thread(target=_run_generation,
+                             args=(job_id, text, n, diff, img, mime), daemon=True)
+        t.start()
+        print(f"[GEN] started job {job_id} target={n}", flush=True)
+        return jsonify({"job_id": job_id, "total": n, "file_info": info})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {str(e)[:200]}"}), 500
 
+@app.route("/progress/<job_id>")
+def progress(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found or expired"}), 404
+        return jsonify({
+            "status": job["status"], "total": job["total"],
+            "generated": job["generated"], "chunks": job.get("chunks", 0),
+            "passes": job.get("passes", 0), "error": job.get("error"),
+            "file_info": job.get("file_info", ""),
+            "questions": job["questions"] if job["status"] == "done" else [],
+        })
 
 @app.route("/explain", methods=["POST"])
 def explain():
@@ -392,13 +533,10 @@ def explain():
         c_hi = (d.get("correct_hi") or c_en).strip()
         if not q_en or not c_en:
             return jsonify({"error": "Missing data"}), 400
-
-        print(f"[EXPLAIN] {q_en[:60]}...", flush=True)
+        print(f"[EXPLAIN] {q_en[:60]}", flush=True)
         raw = ai_raw(explain_prompt(q_en, q_hi or q_en, w or "(none)", c_en, c_hi), fast=True)
         print(f"[EXPLAIN] got {len(raw)} chars", flush=True)
-
-        obj = parse_explain_object(raw)
-        return jsonify({"explanation": obj})
+        return jsonify({"explanation": parse_explain_object(raw)})
     except Exception as e:
         print(f"[EXPLAIN ERR] {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()

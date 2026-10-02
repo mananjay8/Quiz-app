@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QuizGenius — Bilingual AI Quiz</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+  <script>console.log("✅ QuizGenius v2.1 loaded");</script>
+</head>
+<body>
+  <div class="app">
+
+    <section id="setup-screen" class="screen active">
+      <header class="app-header">
+        <div class="avatar">🧠</div>
+        <div>
+          <h1>QuizGenius</h1>
+          <p class="status">Bilingual AI quiz • online</p>
+        </div>
+        <button class="sound-toggle" id="sound-toggle" onclick="toggleSound()">🔊</button>
+      </header>
+
+      <div class="setup-body">
+        <label class="field-label">Paste notes or upload PDF / Image (English or हिंदी)</label>
+        <textarea id="notes-input" rows="6" placeholder="Paste a chapter, notes, or syllabus..."></textarea>
+
+        <div class="file-upload-box">
+          <input type="file" id="file-input" accept=".pdf,.png,.jpg,.jpeg,.webp" hidden>
+          <button type="button" class="btn-ghost" onclick="document.getElementById('file-input').click()">
+            📎 Attach PDF or Image
+          </button>
+          <span id="file-name-display" class="file-name"></span>
+        </div>
+        <p class="hint" id="file-hint"></p>
+
+        <div class="recommend-banner" id="recommend-banner">
+          <span id="recommend-text">Paste some notes to see a recommendation.</span>
+        </div>
+
+        <div class="field">
+          <label class="field-label">
+            Number of Questions: <span id="qcount-display" class="qcount">25</span>
+            <span class="range-hint">(25 – 100)</span>
+          </label>
+          <input type="range" id="num-questions-range" min="25" max="100" step="5" value="25"
+                 oninput="onRangeChange(this.value)">
+        </div>
+
+        <div class="field">
+          <label class="field-label">Difficulty</label>
+          <select id="difficulty">
+            <option value="easy">Easy</option>
+            <option value="medium" selected>Medium</option>
+            <option value="hard">Hard</option>
+          </select>
+        </div>
+
+        <button id="start-btn" class="btn-primary ripple" onclick="startQuiz()">
+          <span>Start Quiz →</span>
+        </button>
+        <p id="setup-error" class="error-text"></p>
+        <button type="button" class="btn-ghost" style="margin-top:0.5rem;width:100%;"
+                onclick="resetServer()">
+          🔄 Stuck? Click here to reset server
+        </button>
+      </div>
+    </section>
+
+    <section id="loading-screen" class="screen">
+      <div class="loader-wrap">
+        <div class="loader"></div>
+        <p id="loading-text">Generating your quiz...</p>
+        <p class="hint" id="loading-subtext"></p>
+        <div class="gen-progress-wrap">
+          <div id="gen-progress-bar" class="gen-progress-bar"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="quiz-screen" class="screen">
+      <div class="progress-bar-wrap">
+        <div id="progress-bar" class="progress-bar"></div>
+      </div>
+
+      <div class="quiz-topbar">
+        <span id="question-counter">Q1 / 25</span>
+        <div class="topbar-right">
+          <div class="lang-toggle">
+            <button class="lang-btn" data-lang="en" onclick="setLang('en')">EN</button>
+            <button class="lang-btn" data-lang="hi" onclick="setLang('hi')">हिं</button>
+            <button class="lang-btn active" data-lang="both" onclick="setLang('both')">Both</button>
+          </div>
+          <span id="streak-display" class="streak hidden">🔥 <span id="streak-count">0</span></span>
+          <span id="timer" class="timer">⏱ 30s</span>
+        </div>
+      </div>
+
+      <div class="chat-area">
+        <div class="bubble bot-bubble">
+          <p id="question-text"></p>
+          <p id="question-text-hi" class="hindi"></p>
+        </div>
+        <div id="options-container" class="options-container"></div>
+        <div id="explanation-box" class="explanation hidden"></div>
+        <div id="learn-more-wrap" class="hidden">
+          <button class="btn-learn" onclick="learnFromBasics()">
+            🧒 Learn this concept from basics
+          </button>
+        </div>
+      </div>
+
+      <button id="next-btn" class="btn-primary hidden ripple" onclick="nextQuestion()">
+        <span>Next Question →</span>
+      </button>
+    </section>
+
+    <section id="results-screen" class="screen">
+      <div class="results-card">
+        <div id="score-circle" class="score-circle">
+          <span id="score-percent">0%</span>
+        </div>
+        <h2 id="score-title">Quiz Complete</h2>
+        <p id="score-detail" class="score-detail"></p>
+        <div id="review-list" class="review-list"></div>
+        <button class="btn-primary ripple" onclick="location.reload()">
+          <span>Take Another Quiz 🔄</span>
+        </button>
+      </div>
+    </section>
+
+  </div>
+
+  <div id="modal" class="modal hidden">
+    <div class="modal-backdrop" onclick="closeModal()"></div>
+    <div class="modal-content">
+      <button class="modal-close" onclick="closeModal()">×</button>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <script>
+    let quiz = [];
+    let currentIndex = 0;
+    let userAnswers = [];
+    let timerInterval = null;
+    let timeLeft = 30;
+    let currentStreak = 0;
+    let longestStreak = 0;
+    let soundEnabled = true;
+    let currentLang = "both";
+    const TIME_PER_QUESTION = 30;
+
+    let audioCtx = null;
+    function beep(freq, dur, type = "sine", gain = 0.15) {
+      if (!soundEnabled) return;
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        osc.type = type; osc.frequency.value = freq; g.gain.value = gain;
+        osc.connect(g); g.connect(audioCtx.destination);
+        osc.start();
+        g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+        osc.stop(audioCtx.currentTime + dur);
+      } catch (e) {}
+    }
+    function playCorrect() { beep(880, 0.12); setTimeout(() => beep(1320, 0.18), 100); }
+    function playWrong() { beep(220, 0.2, "sawtooth"); setTimeout(() => beep(160, 0.3, "sawtooth"), 120); }
+    function playFinish() { [523,659,784,1047].forEach((f,i) => setTimeout(() => beep(f,0.2), i*120)); }
+    function toggleSound() {
+      soundEnabled = !soundEnabled;
+      document.getElementById("sound-toggle").textContent = soundEnabled ? "🔊" : "🔇";
+    }
+    function vibrate(p) { if (navigator.vibrate) try { navigator.vibrate(p); } catch(e){} }
+    function burst(x=0.5, y=0.6) {
+      if (typeof confetti !== "function") return;
+      confetti({ particleCount: 60, spread: 80, origin: {x,y}, scalar: 0.9 });
+    }
+    function celebrate() {
+      if (typeof confetti !== "function") return;
+      const end = Date.now() + 3000;
+      (function frame() {
+        confetti({ particleCount: 6, angle: 60, spread: 70, origin: {x:0,y:0.7} });
+        confetti({ particleCount: 6, angle: 120, spread: 70, origin: {x:1,y:0.7} });
+        if (Date.now() < end) requestAnimationFrame(frame);
+      })();
+      confetti({ particleCount: 150, spread: 160, origin: {y:0.5} });
+    }
+
+    function setLang(lang) {
+      currentLang = lang;
+      document.querySelectorAll(".lang-btn").forEach(b => {
+        b.classList.toggle("active", b.dataset.lang === lang);
+      });
+      if (quiz.length > 0 && currentIndex < quiz.length) renderQuestionContent();
+    }
+    function applyLangVisibility() {
+      const qHi = document.getElementById("question-text-hi");
+      const optHi = document.querySelectorAll(".opt-hi");
+      if (currentLang === "en") {
+        qHi.classList.add("hidden");
+        optHi.forEach(e => e.classList.add("hidden"));
+      } else {
+        qHi.classList.remove("hidden");
+        optHi.forEach(e => e.classList.remove("hidden"));
+      }
+    }
+
+    document.getElementById("file-input").addEventListener("change", function() {
+      const f = this.files[0];
+      const nameEl = document.getElementById("file-name-display");
+      const hintEl = document.getElementById("file-hint");
+      if (!f) { nameEl.textContent = ""; hintEl.textContent = ""; return; }
+      const mb = (f.size / 1024 / 1024).toFixed(2);
+      nameEl.textContent = `${f.name} (${mb} MB)`;
+      if (f.size > 8*1024*1024) {
+        hintEl.textContent = "⚠️ File over 8MB. Please choose a smaller one.";
+        hintEl.style.color = "#e74c3c";
+      } else { hintEl.textContent = ""; }
+      updateRecommendation();
+    });
+
+    let recTimer = null;
+    document.getElementById("notes-input").addEventListener("input", () => {
+      clearTimeout(recTimer);
+      recTimer = setTimeout(updateRecommendation, 500);
+    });
+
+    async function updateRecommendation() {
+      const text = document.getElementById("notes-input").value;
+      const hasFile = document.getElementById("file-input").files.length > 0;
+      if (text.length < 30 && !hasFile) {
+        document.getElementById("recommend-text").textContent =
+          "Paste some notes to see a recommendation.";
+        return;
+      }
+      try {
+        const res = await fetch("/recommend", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text_length: text.length, has_image: hasFile })
+        });
+        const data = await res.json();
+        document.getElementById("recommend-text").innerHTML =
+          `📊 Recommended: <strong>${data.recommended}</strong> questions`;
+        const range = document.getElementById("num-questions-range");
+        range.value = Math.max(25, Math.min(100, Math.round(data.recommended/5)*5));
+        onRangeChange(range.value);
+      } catch (e) {}
+    }
+    function onRangeChange(val) {
+      document.getElementById("qcount-display").textContent = val;
+    }
+
+    function showScreen(id) {
+      document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+      document.getElementById(id).classList.add("active");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+
+    async function startQuiz() {
+      const text = document.getElementById("notes-input").value.trim();
+      const num = parseInt(document.getElementById("num-questions-range").value) || 25;
+      const diff = document.getElementById("difficulty").value;
+      const fileInput = document.getElementById("file-input");
+      const err = document.getElementById("setup-error");
+      const hasFile = fileInput.files.length > 0;
+      const file = hasFile ? fileInput.files[0] : null;
+
+      if (text.length < 50 && !hasFile) {
+        err.textContent = "Please paste text or attach a file."; return;
+      }
+      err.textContent = "";
+      showScreen("loading-screen");
+
+      document.getElementById("loading-text").textContent =
+        `Starting to generate ${num} questions...`;
+      document.getElementById("loading-subtext").textContent =
+        "Runs in background so it won't time out.";
+
+      const fd = new FormData();
+      fd.append("text", text);
+      fd.append("num_questions", num);
+      fd.append("difficulty", diff);
+      if (hasFile) fd.append("file", file);
+
+      try {
+        const res = await fetch("/generate", { method: "POST", body: fd });
+        const raw = await res.text();
+        let data;
+        try { data = JSON.parse(raw); }
+        catch (e) {
+          showScreen("setup-screen");
+          err.textContent = `❌ Server error (${res.status}). Preview: ${raw.slice(0, 200)}`;
+          return;
+        }
+        if (!res.ok || data.error) {
+          showScreen("setup-screen");
+          err.textContent = "❌ " + (data.error || `Error ${res.status}`);
+          return;
+        }
+        if (!data.job_id) {
+          showScreen("setup-screen");
+          err.textContent = "❌ No job id returned.";
+          return;
+        }
+        pollProgress(data.job_id, num);
+      } catch (e) {
+        showScreen("setup-screen");
+        err.textContent = "❌ " + e.message;
+      }
+    }
+
+    async function pollProgress(jobId, target) {
+      const lt = document.getElementById("loading-text");
+      const ls = document.getElementById("loading-subtext");
+      const err = document.getElementById("setup-error");
+      const pb = document.getElementById("gen-progress-bar");
+      const start = Date.now();
+      const MAX_WAIT = 20 * 60 * 1000;
+
+      while (true) {
+        if (Date.now() - start > MAX_WAIT) {
+          showScreen("setup-screen");
+          err.textContent = "❌ Generation took too long. Try fewer questions.";
+          return;
+        }
+        try {
+          const r = await fetch(`/progress/${jobId}`);
+          const p = await r.json();
+
+          if (p.error && !p.status) {
+            showScreen("setup-screen");
+            err.textContent = "❌ " + p.error;
+            return;
+          }
+          if (p.status === "error") {
+            showScreen("setup-screen");
+            err.textContent = "❌ " + (p.error || "Generation failed");
+            return;
+          }
+          if (p.status === "done") {
+            if (!p.questions || p.questions.length === 0) {
+              showScreen("setup-screen");
+              err.textContent = "❌ No questions generated.";
+              return;
+            }
+            if (p.partial) {
+              console.log(`Partial: ${p.questions.length}/${p.total} questions`);
+            }
+            quiz = p.questions;
+            currentIndex = 0;
+            userAnswers = [];
+            currentStreak = 0;
+            longestStreak = 0;
+            updateStreakDisplay();
+            showScreen("quiz-screen");
+            renderQuestion();
+            return;
+          }
+
+          const elapsed = Math.round((Date.now() - start) / 1000);
+          const pct = Math.round((p.generated / p.total) * 100);
+          lt.textContent = `Generating: ${p.generated} / ${p.total} questions`;
+          const eta = p.generated > 0
+            ? Math.round((elapsed / p.generated) * (p.total - p.generated))
+            : null;
+          ls.innerHTML = `<strong>${pct}%</strong> complete` +
+            (eta ? ` · ~${eta}s remaining` : "") + ` · ${elapsed}s elapsed`;
+          if (pb) pb.style.width = pct + "%";
+        } catch (e) {}
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+
+    async function resetServer() {
+      try {
+        const r = await fetch("/reset", { method: "POST" });
+        const d = await r.json();
+        document.getElementById("setup-error").textContent =
+          `✅ Cleared ${d.cleared} stuck job(s). Try again.`;
+      } catch (e) {
+        document.getElementById("setup-error").textContent =
+          "❌ Reset failed: " + e.message;
+      }
+    }
+
+    function updateStreakDisplay() {
+      const el = document.getElementById("streak-display");
+      document.getElementById("streak-count").textContent = currentStreak;
+      el.classList.toggle("hidden", currentStreak < 2);
+      if (currentStreak >= 2) {
+        el.classList.remove("streak-pop");
+        void el.offsetWidth;
+        el.classList.add("streak-pop");
+      }
+    }
+
+    function renderQuestion() {
+      const q = quiz[currentIndex];
+      const progress = (currentIndex / quiz.length) * 100;
+      document.getElementById("progress-bar").style.width = progress + "%";
+      document.getElementById("question-counter").textContent =
+        `Q${currentIndex + 1} / ${quiz.length}`;
+      document.getElementById("question-text").textContent = q.question;
+      document.getElementById("question-text-hi").textContent = q.question_hi || "";
+
+      const container = document.getElementById("options-container");
+      container.innerHTML = "";
+      q.options.forEach((opt, i) => {
+        const btn = document.createElement("button");
+        btn.className = "option-btn";
+        const optHi = (q.options_hi && q.options_hi[i]) || "";
+        btn.innerHTML = `
+          <span class="opt-letter">${String.fromCharCode(65+i)}</span>
+          <span class="opt-body">
+            <span class="opt-en">${escapeHtml(opt)}</span>
+            ${optHi && optHi !== opt ? `<span class="opt-hi hindi">${escapeHtml(optHi)}</span>` : ""}
+          </span>`;
+        btn.onclick = () => selectAnswer(i);
+        container.appendChild(btn);
+      });
+
+      document.getElementById("explanation-box").classList.add("hidden");
+      document.getElementById("next-btn").classList.add("hidden");
+      document.getElementById("learn-more-wrap").classList.add("hidden");
+      applyLangVisibility();
+      startTimer();
+    }
+
+    function renderQuestionContent() {
+      const q = quiz[currentIndex];
+      document.getElementById("question-text").textContent = q.question;
+      document.getElementById("question-text-hi").textContent = q.question_hi || "";
+      document.querySelectorAll(".option-btn").forEach((btn, i) => {
+        const optHi = (q.options_hi && q.options_hi[i]) || "";
+        const body = btn.querySelector(".opt-body");
+        body.innerHTML = `
+          <span class="opt-en">${escapeHtml(q.options[i])}</span>
+          ${optHi && optHi !== q.options[i] ? `<span class="opt-hi hindi">${escapeHtml(optHi)}</span>` : ""}`;
+      });
+      applyLangVisibility();
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c =>
+        ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+    }
+
+    function startTimer() {
+      clearInterval(timerInterval);
+      timeLeft = TIME_PER_QUESTION;
+      updateTimerDisplay();
+      timerInterval = setInterval(() => {
+        timeLeft--;
+        updateTimerDisplay();
+        if (timeLeft <= 0) {
+          clearInterval(timerInterval);
+          selectAnswer(-1);
+        }
+      }, 1000);
+    }
+    function updateTimerDisplay() {
+      const el = document.getElementById("timer");
+      el.textContent = `⏱ ${timeLeft}s`;
+      el.classList.toggle("timer-warn", timeLeft <= 10);
+    }
+
+    function selectAnswer(sel) {
+      clearInterval(timerInterval);
+      const q = quiz[currentIndex];
+      const correctIndex = q.correct;
+      const buttons = document.querySelectorAll(".option-btn");
+      buttons.forEach(b => b.disabled = true);
+      buttons.forEach((btn, i) => {
+        if (i === correctIndex) btn.classList.add("correct", "pop");
+        if (i === sel && sel !== correctIndex) btn.classList.add("wrong", "shake");
+      });
+
+      const isCorrect = sel === correctIndex;
+      if (isCorrect) {
+        currentStreak++;
+        if (currentStreak > longestStreak) longestStreak = currentStreak;
+      } else { currentStreak = 0; }
+      updateStreakDisplay();
+
+      userAnswers.push({
+        questionIndex: currentIndex, selected: sel,
+        correct: correctIndex, isCorrect
+      });
+
+      if (isCorrect) {
+        playCorrect(); vibrate([80]);
+        const btn = buttons[sel];
+        const rect = btn.getBoundingClientRect();
+        burst((rect.left+rect.width/2)/window.innerWidth,
+              (rect.top+rect.height/2)/window.innerHeight);
+      } else if (sel === -1) { playWrong(); vibrate([300,100,300]); }
+      else { playWrong(); vibrate([200,80,200]); }
+
+      const exp = document.getElementById("explanation-box");
+      const expEn = q.explanation || "Correct answer: " + q.options[correctIndex];
+      const expHi = q.explanation_hi || expEn;
+      exp.innerHTML = `
+        <strong>${isCorrect ? "✅ Correct! / सही!" : "❌ " + (sel === -1 ? "Time's up!" : "Incorrect / गलत")}</strong>
+        <p>${escapeHtml(expEn)}</p>
+        ${expHi !== expEn ? `<p class="hindi">${escapeHtml(expHi)}</p>` : ""}`;
+      exp.classList.remove("hidden");
+      exp.classList.add(isCorrect ? "exp-correct" : "exp-wrong");
+
+      if (!isCorrect) document.getElementById("learn-more-wrap").classList.remove("hidden");
+
+      const nextBtn = document.getElementById("next-btn");
+      nextBtn.classList.remove("hidden");
+      nextBtn.querySelector("span").textContent = (currentIndex === quiz.length - 1)
+        ? "See Results 📊" : "Next Question →";
+    }
+
+    function nextQuestion() {
+      currentIndex++;
+      if (currentIndex < quiz.length) renderQuestion();
+      else showResults();
+    }
+
+    async function learnFromBasics() {
+      const q = quiz[currentIndex];
+      const ua = userAnswers.find(a => a.questionIndex === currentIndex);
+      const wrongText = ua && ua.selected >= 0 ? q.options[ua.selected] : "(no answer)";
+      openModal("loading");
+      try {
+        const res = await fetch("/explain", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: q.question,
+            question_hi: q.question_hi,
+            wrong: wrongText,
+            correct: q.options[q.correct],
+            correct_hi: (q.options_hi && q.options_hi[q.correct]) || q.options[q.correct]
+          })
+        });
+        const data = await res.json();
+        if (data.error) { openModal("error", data.error); return; }
+        openModal("explanation", data.explanation);
+      } catch (e) { openModal("error", e.message); }
+    }
+
+    function openModal(kind, payload) {
+      const modal = document.getElementById("modal");
+      const body = document.getElementById("modal-body");
+      modal.classList.remove("hidden");
+      if (kind === "loading") {
+        body.innerHTML = `<div class="modal-loading"><div class="loader"></div><p>Preparing a simple explanation...</p></div>`;
+        return;
+      }
+      if (kind === "error") {
+        body.innerHTML = `<h2>❌ Error</h2><p>${escapeHtml(payload)}</p>`;
+        return;
+      }
+      const e = payload;
+      const pts = (e.basic_points || []).map(p => `<li>${escapeHtml(p)}</li>`).join("");
+      const ptsHi = (e.basic_points_hi || []).map(p => `<li class="hindi">${escapeHtml(p)}</li>`).join("");
+      body.innerHTML = `
+        <h2>🧒 ${escapeHtml(e.topic || "Concept")}</h2>
+        <p class="hindi topic-hi">${escapeHtml(e.topic_hi || "")}</p>
+        <div class="modal-section">
+          <h3>Why the wrong answer is wrong</h3>
+          <p>${escapeHtml(e.why_wrong || "")}</p>
+          <p class="hindi">${escapeHtml(e.why_wrong_hi || "")}</p>
+        </div>
+        <div class="modal-section analogy">
+          <h3>💡 Think of it like this</h3>
+          <p>${escapeHtml(e.analogy || "")}</p>
+          <p class="hindi">${escapeHtml(e.analogy_hi || "")}</p>
+        </div>
+        <div class="modal-section">
+          <h3>📚 The basics, step by step</h3>
+          <ul>${pts}</ul>
+          <ul class="hindi">${ptsHi}</ul>
+        </div>
+        <div class="modal-section example">
+          <h3>🌍 Example</h3>
+          <p>${escapeHtml(e.example || "")}</p>
+          <p class="hindi">${escapeHtml(e.example_hi || "")}</p>
+        </div>
+        <div class="modal-section trick">
+          <h3>🧠 Memory trick</h3>
+          <p>${escapeHtml(e.memory_trick || "")}</p>
+          <p class="hindi">${escapeHtml(e.memory_trick_hi || "")}</p>
+        </div>
+        <div class="modal-encourage">
+          <p>${escapeHtml(e.encouragement || "Keep going!")}</p>
+          <p class="hindi">${escapeHtml(e.encouragement_hi || "")}</p>
+        </div>`;
+    }
+    function closeModal() { document.getElementById("modal").classList.add("hidden"); }
+
+    function showResults() {
+      const total = quiz.length;
+      const correctCount = userAnswers.filter(a => a.isCorrect).length;
+      const percent = Math.round((correctCount / total) * 100);
+      document.getElementById("score-percent").textContent = percent + "%";
+      document.getElementById("score-detail").textContent =
+        `You answered ${correctCount} out of ${total} correctly.` +
+        (longestStreak >= 3 ? ` Longest streak: ${longestStreak} 🔥` : "");
+
+      let title = "Keep Practicing 💪";
+      if (percent === 100) title = "Perfect Score! 🏆";
+      else if (percent >= 80) title = "Excellent! 🌟";
+      else if (percent >= 60) title = "Good Job! 👍";
+      document.getElementById("score-title").textContent = title;
+
+      const circle = document.getElementById("score-circle");
+      circle.style.background = percent >= 80
+        ? "linear-gradient(135deg,#2ecc71,#27ae60)"
+        : percent >= 60 ? "linear-gradient(135deg,#f39c12,#e67e22)"
+        : "linear-gradient(135deg,#e74c3c,#c0392b)";
+
+      if (percent >= 80) { celebrate(); playFinish(); vibrate([100,50,100,50,200]); }
+      else if (percent >= 60) { burst(0.5, 0.5); vibrate([100]); }
+
+      const review = document.getElementById("review-list");
+      review.innerHTML = "<h3>Review</h3>";
+      userAnswers.forEach((a, i) => {
+        const q = quiz[a.questionIndex];
+        const div = document.createElement("div");
+        div.className = "review-item " + (a.isCorrect ? "rev-correct" : "rev-wrong");
+        const wrongText = a.selected === -1 ? "— (no answer)" : (q.options[a.selected] || "");
+        const correctText = q.options[a.correct] || "";
+        const correctHi = (q.options_hi && q.options_hi[a.correct]) || correctText;
+        div.innerHTML = `
+          <p class="review-q"><strong>Q${i+1}.</strong> ${escapeHtml(q.question)}</p>
+          ${q.question_hi ? `<p class="hindi review-qh">${escapeHtml(q.question_hi)}</p>` : ""}
+          <p class="review-a">
+            ${a.isCorrect ? "✅ Correct / सही"
+              : `❌ You chose: ${escapeHtml(wrongText)}<br>✅ Correct: ${escapeHtml(correctText)}
+                 ${correctHi !== correctText ? `<br><span class="hindi">सही: ${escapeHtml(correctHi)}</span>` : ""}`}
+          </p>
+          ${!a.isCorrect ? `<button class="btn-learn-small" onclick="learnFromResults(${i})">🧒 Learn from basics</button>` : ""}`;
+        review.appendChild(div);
+      });
+      showScreen("results-screen");
+    }
+
+    async function learnFromResults(i) {
+      const a = userAnswers[i];
+      const q = quiz[a.questionIndex];
+      const wrongText = a.selected === -1 ? "(no answer)" : (q.options[a.selected] || "");
+      openModal("loading");
+      try {
+        const res = await fetch("/explain", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: q.question, question_hi: q.question_hi,
+            wrong: wrongText, correct: q.options[q.correct],
+            correct_hi: (q.options_hi && q.options_hi[q.correct]) || q.options[q.correct]
+          })
+        });
+        const data = await res.json();
+        if (data.error) { openModal("error", data.error); return; }
+        openModal("explanation", data.explanation);
+      } catch (e) { openModal("error", e.message); }
+    }
+
+    document.addEventListener("click", (e) => {
+      const t = e.target.closest(".ripple, .option-btn");
+      if (!t) return;
+      const rect = t.getBoundingClientRect();
+      const r = document.createElement("span");
+      const size = Math.max(rect.width, rect.height);
+      r.className = "ripple-effect";
+      r.style.width = r.style.height = size + "px";
+      r.style.left = (e.clientX - rect.left - size/2) + "px";
+      r.style.top = (e.clientY - rect.top - size/2) + "px";
+      t.appendChild(r);
+      setTimeout(() => r.remove(), 600);
+    });
+  </script>
+</body>
+</html>

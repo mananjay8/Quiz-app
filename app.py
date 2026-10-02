@@ -7,10 +7,11 @@ app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
-GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "meta-llama/llama-4-scout-17b-16e-instruct"]
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"]
+...
+FAST_GEMINI = ["gemini-2.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash"]
 
-FAST_GEMINI = ["gemini-2.0-flash", "gemini-2.5-flash"]
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "meta-llama/llama-4-scout-17b-16e-instruct"]
 FAST_GROQ = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 
 CHUNK_SIZE = 2500
